@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+type captureKey struct {
+	runID model.ID
+	layer int
+}
+
 type Runtime struct {
 	mu              sync.RWMutex
 	Monitor         *optical.Monitor
@@ -31,12 +36,13 @@ type Runtime struct {
 	Shutter         *shutter.Controller
 	Sequence        int64
 	StartedAt       time.Time
+	captured        map[captureKey]model.LayerEvidence
 }
 
 func NewRuntime() *Runtime {
 	driver := shutter.NewDriver()
 	feedback := shutter.NewFeedback()
-	return &Runtime{Monitor: optical.NewMonitor(), Window: optical.NewThicknessWindow(128), Broadcast: optical.NewBroadcaster(), Traces: journal.NewTraceStore(), Incidents: journal.NewIncidentStore(), Timeline: run.NewTimeline(), VacuumTelemetry: vacuum.NewTelemetry(128), RevisionStore: recipe.NewRevisionStore(), InterlockAudit: interlock.NewAudit(), Shutter: shutter.NewController(driver, feedback), StartedAt: time.Now().UTC()}
+	return &Runtime{Monitor: optical.NewMonitor(), Window: optical.NewThicknessWindow(128), Broadcast: optical.NewBroadcaster(), Traces: journal.NewTraceStore(), Incidents: journal.NewIncidentStore(), Timeline: run.NewTimeline(), VacuumTelemetry: vacuum.NewTelemetry(128), RevisionStore: recipe.NewRevisionStore(), InterlockAudit: interlock.NewAudit(), Shutter: shutter.NewController(driver, feedback), StartedAt: time.Now().UTC(), captured: map[captureKey]model.LayerEvidence{}}
 }
 
 func (r *Runtime) NextSequence() int64 {
@@ -51,16 +57,27 @@ func (r *Runtime) Capture(sample model.ThicknessSample, layer int) (model.LayerE
 	if sample.At.IsZero() {
 		sample.At = time.Now().UTC()
 	}
-	r.Monitor.Add(sample)
-	r.Window.Add(sample)
-	r.Traces.AppendThickness(sample)
-	_ = r.Broadcast.PublishThen(sample, nil)
 	evidence := model.BuildLayerEvidence(sample, layer)
 	if err := evidence.Validate(); err != nil {
 		r.Incidents.Raise(sample.RunID, "warning", err.Error())
 		return evidence, err
 	}
+	key := captureKey{runID: sample.RunID, layer: layer}
+	r.mu.Lock()
+	if r.captured == nil {
+		r.captured = map[captureKey]model.LayerEvidence{}
+	}
+	if committed, ok := r.captured[key]; ok {
+		r.mu.Unlock()
+		return committed, nil
+	}
+	r.captured[key] = evidence
+	r.Monitor.Add(sample)
+	r.Window.Add(sample)
+	r.Traces.AppendThickness(sample)
+	r.Broadcast.Publish(sample)
 	r.Timeline.Add(sample.RunID, "thickness", fmt.Sprintf("%.3f nm", sample.Nanometers))
+	r.mu.Unlock()
 	return evidence, nil
 }
 
